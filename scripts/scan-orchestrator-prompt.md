@@ -13,19 +13,23 @@ This scans top 100 crypto, filters by momentum, and deep-analyzes the top 5 on T
 ### Step 2: Read the Results
 Read `/Users/apex/tradingview-mcp/scans/latest.json` for the scan results.
 
-### Step 3: Check Liquidation Heatmaps via Chrome
-For each setup found, check CoinGlass liquidation data:
+### Step 3: Check Liquidation Data via CoinGlass API
+```bash
+export PATH="/opt/homebrew/bin:$PATH" && cd /Users/apex/tradingview-mcp && node scripts/check-liquidation-heatmap.js
+```
+This uses the CoinGlass API to fetch:
+- Funding rates (positive = longs crowded, negative = shorts crowded)
+- Open interest (rising OI + price move = conviction)
+- Long/short ratio (extreme ratios = squeeze potential)
+- 24h liquidation data (which side is getting liquidated more)
 
-1. Get Chrome tab context via `tabs_context_mcp`
-2. For each symbol with a trade setup:
-   a. Navigate to `https://www.coinglass.com/pro/futures/LiquidationHeatMap` and use the pair dropdown to switch to the symbol (e.g., Binance ETHUSDT Perp)
-   b. Wait 3 seconds for the heatmap to load
-   c. Take a screenshot of the heatmap
-   d. Read the page text to find liquidation clusters
-   e. Determine if large liquidation pools exist:
-      - **Above current price** → potential magnet for longs (supports LONG trades)
-      - **Below current price** → potential magnet for shorts (supports SHORT trades)
-   f. Check funding rate and open interest on the same page
+Each setup gets a verdict: `supports_trade`, `against_trade`, or `neutral` with adjustment points.
+
+### Step 3b (Optional): Visual Heatmap Confirmation via Chrome
+For the top 1-2 setups, optionally open the visual heatmap:
+1. Navigate to `https://www.coinglass.com/pro/futures/LiquidationHeatMap`
+2. Use the pair dropdown to switch to the symbol
+3. Screenshot for visual confirmation of liquidation clusters
 
 ### Step 4: Cross-Reference and Score
 For each trade setup, combine:
