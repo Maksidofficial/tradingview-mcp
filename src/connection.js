@@ -1,11 +1,56 @@
 import CDP from 'chrome-remote-interface';
+import http from 'http';
 
 let client = null;
 let targetInfo = null;
-const CDP_HOST = 'localhost';
-const CDP_PORT = 9222;
+// Host/port are configurable so the server can run in a container and reach
+// TradingView Desktop on the host (e.g. CDP_HOST=host.docker.internal).
+// Defaults match a native install, so existing users need no configuration.
+const CDP_HOST = process.env.CDP_HOST || 'localhost';
+const CDP_PORT = Number(process.env.CDP_PORT) || 9222;
 const MAX_RETRIES = 5;
 const BASE_DELAY = 500;
+
+// Chrome's DevTools Protocol rejects any request whose Host header is not
+// localhost/127.0.0.1, even with --remote-debugging-address=0.0.0.0.
+// Node's fetch() drops Host header overrides (forbidden header), so we use
+// http.request() directly for /json/list and /json/activate calls, and
+// rewrite the ws:// URL to keep the Host header as localhost on the
+// WebSocket upgrade.
+export function cdpHttpGet(hostname, port, path) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname, port, path, method: 'GET', headers: { Host: 'localhost' } },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          try { resolve(JSON.parse(data)); }
+          catch { reject(new Error(`Invalid JSON from CDP at ${path}: ${data.slice(0, 120)}`)); }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+export function cdpHttpRaw(hostname, port, path) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname, port, path, method: 'GET', headers: { Host: 'localhost' } },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => resolve({ statusCode: res.statusCode, body: data }));
+      }
+    );
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+export { CDP_HOST, CDP_PORT };
 
 // Known direct API paths discovered via live probing (see PROBE_RESULTS.md)
 const KNOWN_PATHS = {
@@ -70,7 +115,12 @@ export async function connect() {
         throw new Error('No TradingView chart target found. Is TradingView open with a chart?');
       }
       targetInfo = target;
-      client = await CDP({ host: CDP_HOST, port: CDP_PORT, target: target.id });
+      // Rewrite the ws:// URL returned by Chrome so the connection goes to
+      // CDP_HOST:CDP_PORT. Pass Host: localhost so Chrome accepts the upgrade
+      // when CDP_HOST is a non-localhost name (e.g. host.docker.internal).
+      const wsUrl = (target.webSocketDebuggerUrl || '')
+        .replace(/^ws:\/\/[^/]+/, `ws://${CDP_HOST}:${CDP_PORT}`);
+      client = await CDP({ target: wsUrl, headers: { Host: 'localhost' } });
 
       // Enable required domains
       await client.Runtime.enable();
@@ -88,8 +138,7 @@ export async function connect() {
 }
 
 async function findChartTarget() {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
+  const targets = await cdpHttpGet(CDP_HOST, CDP_PORT, '/json/list');
   // Prefer targets with tradingview.com/chart in the URL
   return targets.find(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
     || targets.find(t => t.type === 'page' && /tradingview/i.test(t.url))
