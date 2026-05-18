@@ -1,0 +1,387 @@
+//@version=5
+strategy("Liquidity Scalp Bot [LTF]",
+     overlay        = true,
+     default_qty_type  = strategy.percent_of_equity,
+     default_qty_value = 2,
+     commission_type   = strategy.commission.percent,
+     commission_value  = 0.005,
+     slippage          = 1,
+     max_bars_back     = 500)
+
+// ═══════════════════════════════════════════════════════════
+//  INPUTS
+// ═══════════════════════════════════════════════════════════
+
+grp_liq   = "Liquidity Pools"
+liq_lb    = input.int(15,  "Pivot Lookback",           group=grp_liq, minval=5, maxval=50)
+max_pools = input.int(3,   "Max Levels to Track",      group=grp_liq, minval=1, maxval=5)
+
+grp_flt   = "Filters"
+ob_atr    = input.float(1.5, "Displacement (ATR mult)", group=grp_flt, minval=0.5, step=0.1)
+vol_mult  = input.float(1.2, "Volume Mult (>avg)",      group=grp_flt, minval=1.0, step=0.1)
+fvg_min   = input.float(0.05,"Min FVG Size (%)",        group=grp_flt, minval=0.01, step=0.01)
+
+grp_risk  = "Risk Management"
+rr_min    = input.float(2.0, "Min R:R Ratio",           group=grp_risk, minval=1.0, step=0.1)
+stop_buf  = input.float(0.1, "Stop Buffer (%)",         group=grp_risk, minval=0.0, step=0.05)
+max_hold  = input.int(6,     "Max Bars to Hold",        group=grp_risk, minval=1, maxval=20)
+
+grp_sess  = "Session Filter"
+use_sess  = input.bool(true,           "Enable Session Filter", group=grp_sess)
+sess_ny   = input.session("0830-1600", "NY Session",            group=grp_sess)
+sess_lon  = input.session("0200-1100", "London Session",        group=grp_sess)
+
+grp_vis   = "Display"
+show_bsl  = input.bool(true,  "Show BSL Levels", group=grp_vis)
+show_ssl  = input.bool(true,  "Show SSL Levels", group=grp_vis)
+show_fvg  = input.bool(true,  "Show FVG Boxes",  group=grp_vis)
+show_ob   = input.bool(true,  "Show OB Boxes",   group=grp_vis)
+
+// ═══════════════════════════════════════════════════════════
+//  LIQUIDITY POOL DETECTION
+// ═══════════════════════════════════════════════════════════
+
+ph = ta.pivothigh(high, liq_lb, liq_lb)
+pl = ta.pivotlow(low,  liq_lb, liq_lb)
+
+var bsl_arr = array.new_float(0)  // buy-side liquidity (above)
+var ssl_arr = array.new_float(0)  // sell-side liquidity (below)
+
+if not na(ph)
+    array.unshift(bsl_arr, ph)
+    if array.size(bsl_arr) > max_pools
+        array.pop(bsl_arr)
+
+if not na(pl)
+    array.unshift(ssl_arr, pl)
+    if array.size(ssl_arr) > max_pools
+        array.pop(ssl_arr)
+
+bsl_near = array.size(bsl_arr) > 0 ? array.get(bsl_arr, 0) : na
+ssl_near = array.size(ssl_arr) > 0 ? array.get(ssl_arr, 0) : na
+
+// Second pool (next target beyond immediate level)
+bsl_far  = array.size(bsl_arr) > 1 ? array.get(bsl_arr, 1) : na
+ssl_far  = array.size(ssl_arr) > 1 ? array.get(ssl_arr, 1) : na
+
+// ═══════════════════════════════════════════════════════════
+//  SWEEP DETECTION  (within last 3 bars)
+// ═══════════════════════════════════════════════════════════
+
+var float swept_ssl_lvl = na   // SSL was swept → potential long setup
+var float swept_bsl_lvl = na   // BSL was swept → potential short setup
+var int   swept_bar     = 0
+
+// Reset when we enter a new trade (avoid stale sweeps)
+if strategy.position_size != 0
+    swept_ssl_lvl := na
+    swept_bsl_lvl := na
+
+for i = 0 to 2
+    if not na(ssl_near) and low[i] < ssl_near and close[i] > ssl_near
+        swept_ssl_lvl := ssl_near
+        swept_bar     := bar_index - i
+    if not na(bsl_near) and high[i] > bsl_near and close[i] < bsl_near
+        swept_bsl_lvl := bsl_near
+        swept_bar     := bar_index - i
+
+bull_sweep = not na(swept_ssl_lvl)
+bear_sweep = not na(swept_bsl_lvl)
+
+// ═══════════════════════════════════════════════════════════
+//  DISPLACEMENT CANDLES
+// ═══════════════════════════════════════════════════════════
+
+atr_val      = ta.atr(14)
+bull_displace = close > open and (close - open) > atr_val * ob_atr
+bear_displace = close < open and (open - close) > atr_val * ob_atr
+
+// ═══════════════════════════════════════════════════════════
+//  ORDER BLOCKS  (last opposing candle before displacement)
+// ═══════════════════════════════════════════════════════════
+
+var float bull_ob_hi = na
+var float bull_ob_lo = na
+var float bear_ob_hi = na
+var float bear_ob_lo = na
+
+if bull_displace
+    // Last candle before this was the order block
+    bull_ob_hi := high[1]
+    bull_ob_lo := low[1]
+
+if bear_displace
+    bear_ob_hi := high[1]
+    bear_ob_lo := low[1]
+
+in_bull_ob = not na(bull_ob_lo) and close >= bull_ob_lo and close <= bull_ob_hi
+in_bear_ob = not na(bear_ob_hi) and close >= bear_ob_lo and close <= bear_ob_hi
+
+// ═══════════════════════════════════════════════════════════
+//  FAIR VALUE GAPS  (3-candle imbalance)
+// ═══════════════════════════════════════════════════════════
+
+// Bullish FVG: current low > two-bars-ago high
+bfvg_top   = low[0]
+bfvg_bot   = high[2]
+bfvg_valid = low[0] > high[2] and (low[0] - high[2]) / high[2] * 100 >= fvg_min
+
+// Bearish FVG: current high < two-bars-ago low
+rfvg_bot   = high[0]
+rfvg_top   = low[2]
+rfvg_valid = high[0] < low[2] and (low[2] - high[0]) / low[2] * 100 >= fvg_min
+
+in_bull_fvg = bfvg_valid and close >= bfvg_bot and close <= bfvg_top
+in_bear_fvg = rfvg_valid and close >= rfvg_bot and close <= rfvg_top
+
+// ═══════════════════════════════════════════════════════════
+//  CONFLUENCE FILTERS
+// ═══════════════════════════════════════════════════════════
+
+vwap_val   = ta.vwap(close)
+rsi_val    = ta.rsi(close, 14)
+avg_vol    = ta.sma(volume, 20)
+
+above_vwap = close > vwap_val
+below_vwap = close < vwap_val
+vol_ok     = volume > avg_vol * vol_mult
+rsi_long   = rsi_val > 30 and rsi_val < 65
+rsi_short  = rsi_val < 70 and rsi_val > 35
+
+in_session = not use_sess
+    or (not na(time(timeframe.period, sess_ny,  "UTC-5")))
+    or (not na(time(timeframe.period, sess_lon, "UTC")))
+
+// Confluence score (0-5, for dashboard display)
+long_score  = (bull_sweep ? 1 : 0) + (bull_displace ? 1 : 0)
+           + ((in_bull_fvg or in_bull_ob) ? 1 : 0)
+           + (above_vwap ? 1 : 0) + (vol_ok ? 1 : 0)
+short_score = (bear_sweep ? 1 : 0) + (bear_displace ? 1 : 0)
+           + ((in_bear_fvg or in_bear_ob) ? 1 : 0)
+           + (below_vwap ? 1 : 0) + (vol_ok ? 1 : 0)
+
+// ═══════════════════════════════════════════════════════════
+//  ENTRY / RISK CALCULATION
+// ═══════════════════════════════════════════════════════════
+
+long_stop_raw  = not na(swept_ssl_lvl) ? swept_ssl_lvl * (1 - stop_buf / 100) : na
+short_stop_raw = not na(swept_bsl_lvl) ? swept_bsl_lvl * (1 + stop_buf / 100) : na
+
+// Target = nearest opposing liquidity pool; fall back to R:R projection
+long_tgt_raw  = not na(bsl_near) ? bsl_near
+    : not na(long_stop_raw) ? close + (close - long_stop_raw) * rr_min : na
+short_tgt_raw = not na(ssl_near) ? ssl_near
+    : not na(short_stop_raw) ? close - (short_stop_raw - close) * rr_min : na
+
+long_rr_ok  = not na(long_stop_raw)  and not na(long_tgt_raw)
+    and long_tgt_raw  > close and close > long_stop_raw
+    and (long_tgt_raw  - close) / (close - long_stop_raw)  >= rr_min
+short_rr_ok = not na(short_stop_raw) and not na(short_tgt_raw)
+    and short_tgt_raw < close and close < short_stop_raw
+    and (close - short_tgt_raw) / (short_stop_raw - close) >= rr_min
+
+// ═══════════════════════════════════════════════════════════
+//  FULL ENTRY CONDITIONS  (all confluences must align)
+// ═══════════════════════════════════════════════════════════
+
+long_signal  = bull_sweep
+    and bull_displace
+    and (in_bull_fvg or in_bull_ob)
+    and above_vwap
+    and vol_ok
+    and rsi_long
+    and in_session
+    and strategy.position_size == 0
+
+short_signal = bear_sweep
+    and bear_displace
+    and (in_bear_fvg or in_bear_ob)
+    and below_vwap
+    and vol_ok
+    and rsi_short
+    and in_session
+    and strategy.position_size == 0
+
+// ═══════════════════════════════════════════════════════════
+//  STRATEGY EXECUTION
+// ═══════════════════════════════════════════════════════════
+
+var int bars_held = 0
+
+if strategy.position_size != 0
+    bars_held += 1
+else
+    bars_held := 0
+
+if long_signal and long_rr_ok
+    strategy.entry("Long",  strategy.long)
+    strategy.exit("L_Exit", "Long",  stop=long_stop_raw,  limit=long_tgt_raw)
+
+if short_signal and short_rr_ok
+    strategy.entry("Short", strategy.short)
+    strategy.exit("S_Exit", "Short", stop=short_stop_raw, limit=short_tgt_raw)
+
+// Time-based exit after max_hold bars
+if bars_held >= max_hold and strategy.position_size != 0
+    strategy.close_all("Time Exit")
+
+// ═══════════════════════════════════════════════════════════
+//  VISUALS — Liquidity Levels
+// ═══════════════════════════════════════════════════════════
+
+plot(show_bsl and not na(bsl_near) ? bsl_near : na, "BSL 1",
+     color=color.new(color.blue, 20), linewidth=1, style=plot.style_circles)
+plot(show_bsl and not na(bsl_far)  ? bsl_far  : na, "BSL 2",
+     color=color.new(color.blue, 60), linewidth=1, style=plot.style_circles)
+plot(show_ssl and not na(ssl_near) ? ssl_near : na, "SSL 1",
+     color=color.new(color.red, 20),  linewidth=1, style=plot.style_circles)
+plot(show_ssl and not na(ssl_far)  ? ssl_far  : na, "SSL 2",
+     color=color.new(color.red, 60),  linewidth=1, style=plot.style_circles)
+
+plot(vwap_val, "VWAP", color=color.new(color.orange, 0), linewidth=2)
+
+// ═══════════════════════════════════════════════════════════
+//  VISUALS — FVG Boxes
+// ═══════════════════════════════════════════════════════════
+
+var box bull_fvg_box = na
+var box bear_fvg_box = na
+
+if show_fvg and bfvg_valid
+    box.delete(bull_fvg_box)
+    bull_fvg_box := box.new(bar_index - 2, bfvg_top, bar_index + 20, bfvg_bot,
+         border_color=color.new(color.green, 60),
+         bgcolor=color.new(color.green, 88))
+
+if show_fvg and rfvg_valid
+    box.delete(bear_fvg_box)
+    bear_fvg_box := box.new(bar_index - 2, rfvg_top, bar_index + 20, rfvg_bot,
+         border_color=color.new(color.red, 60),
+         bgcolor=color.new(color.red, 88))
+
+// ═══════════════════════════════════════════════════════════
+//  VISUALS — Order Block Boxes
+// ═══════════════════════════════════════════════════════════
+
+var box b_ob_box = na
+var box s_ob_box = na
+
+if show_ob and bull_displace
+    box.delete(b_ob_box)
+    b_ob_box := box.new(bar_index - 1, bull_ob_hi, bar_index + 15, bull_ob_lo,
+         border_color=color.new(color.teal, 40),
+         bgcolor=color.new(color.teal, 85))
+
+if show_ob and bear_displace
+    box.delete(s_ob_box)
+    s_ob_box := box.new(bar_index - 1, bear_ob_hi, bar_index + 15, bear_ob_lo,
+         border_color=color.new(color.orange, 40),
+         bgcolor=color.new(color.orange, 85))
+
+// ═══════════════════════════════════════════════════════════
+//  VISUALS — Sweep + Signal Markers
+// ═══════════════════════════════════════════════════════════
+
+// Sweep markers
+plotshape(bull_sweep and strategy.position_size == 0, "SSL Sweep",
+     style=shape.xcross, location=location.belowbar,
+     color=color.new(color.green, 30), size=size.tiny)
+plotshape(bear_sweep and strategy.position_size == 0, "BSL Sweep",
+     style=shape.xcross, location=location.abovebar,
+     color=color.new(color.red, 30), size=size.tiny)
+
+// Entry signals
+plotshape(long_signal and long_rr_ok, "Long Entry",
+     style=shape.triangleup, location=location.belowbar,
+     color=color.green, size=size.normal)
+plotshape(short_signal and short_rr_ok, "Short Entry",
+     style=shape.triangledown, location=location.abovebar,
+     color=color.red, size=size.normal)
+
+// Entry price labels
+if long_signal and long_rr_ok
+    lbl = label.new(bar_index, low - atr_val,
+         "LONG\nE: " + str.tostring(close, "#.##") +
+         "\nSL: " + str.tostring(long_stop_raw, "#.##") +
+         "\nTP: " + str.tostring(long_tgt_raw, "#.##"),
+         style=label.style_label_up,
+         color=color.new(color.green, 20),
+         textcolor=color.white, size=size.small)
+
+if short_signal and short_rr_ok
+    lbl = label.new(bar_index, high + atr_val,
+         "SHORT\nE: " + str.tostring(close, "#.##") +
+         "\nSL: " + str.tostring(short_stop_raw, "#.##") +
+         "\nTP: " + str.tostring(short_tgt_raw, "#.##"),
+         style=label.style_label_down,
+         color=color.new(color.red, 20),
+         textcolor=color.white, size=size.small)
+
+// ═══════════════════════════════════════════════════════════
+//  DASHBOARD TABLE
+// ═══════════════════════════════════════════════════════════
+
+var table dash = table.new(position.top_right, 2, 10,
+     bgcolor=color.new(color.black, 75),
+     border_color=color.new(color.gray, 60), border_width=1,
+     frame_color=color.new(color.gray, 40), frame_width=1)
+
+if barstate.islast
+    // Header
+    table.cell(dash, 0, 0, "SCALP BOT", bgcolor=color.new(color.navy, 20),
+         text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 0, str.tostring(close, "#.##"),
+         bgcolor=color.new(color.navy, 20), text_color=color.yellow, text_size=size.small)
+
+    // Liquidity
+    table.cell(dash, 0, 1, "BSL", text_color=color.new(color.blue, 20),  text_size=size.tiny)
+    table.cell(dash, 1, 1, not na(bsl_near) ? str.tostring(bsl_near, "#.##") : "—",
+         text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 0, 2, "SSL", text_color=color.new(color.red, 0),    text_size=size.tiny)
+    table.cell(dash, 1, 2, not na(ssl_near) ? str.tostring(ssl_near, "#.##") : "—",
+         text_color=color.white, text_size=size.tiny)
+
+    // Filters
+    table.cell(dash, 0, 3, "VWAP",    text_color=color.orange, text_size=size.tiny)
+    table.cell(dash, 1, 3, above_vwap ? "ABOVE ▲" : "BELOW ▼",
+         text_color=above_vwap ? color.green : color.red, text_size=size.tiny)
+
+    table.cell(dash, 0, 4, "RSI",     text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 4, str.tostring(math.round(rsi_val, 1)),
+         text_color=rsi_val > 70 ? color.red : rsi_val < 30 ? color.green : color.white,
+         text_size=size.tiny)
+
+    table.cell(dash, 0, 5, "VOLUME",  text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 5, vol_ok ? "HIGH ✓" : "LOW ✗",
+         text_color=vol_ok ? color.green : color.gray, text_size=size.tiny)
+
+    table.cell(dash, 0, 6, "SESSION", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 6, in_session ? "ACTIVE ✓" : "CLOSED",
+         text_color=in_session ? color.green : color.gray, text_size=size.tiny)
+
+    // Confluence score
+    score     = strategy.position_size > 0 ? long_score : strategy.position_size < 0 ? short_score : math.max(long_score, short_score)
+    score_col = score >= 4 ? color.green : score >= 2 ? color.yellow : color.gray
+    table.cell(dash, 0, 7, "CONFLUENCE", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 7, str.tostring(score) + " / 5",
+         text_color=score_col, text_size=size.tiny)
+
+    // Signal
+    sig_txt = long_signal  and long_rr_ok  ? "LONG  ▲" :
+              short_signal and short_rr_ok ? "SHORT ▼" :
+              long_score  >= 3             ? "WATCH ▲" :
+              short_score >= 3             ? "WATCH ▼" : "NONE"
+    sig_col = long_signal  and long_rr_ok  ? color.lime  :
+              short_signal and short_rr_ok ? color.red   :
+              long_score  >= 3             ? color.new(color.green, 40) :
+              short_score >= 3             ? color.new(color.red, 40)   : color.gray
+    table.cell(dash, 0, 8, "SIGNAL",   text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 8, sig_txt, text_color=sig_col, text_size=size.small)
+
+    // Position status
+    pos_txt = strategy.position_size > 0 ? "LONG  " + str.tostring(bars_held) + "b" :
+              strategy.position_size < 0 ? "SHORT " + str.tostring(bars_held) + "b" : "FLAT"
+    pos_col = strategy.position_size > 0 ? color.lime :
+              strategy.position_size < 0 ? color.red  : color.gray
+    table.cell(dash, 0, 9, "POSITION", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 9, pos_txt, text_color=pos_col, text_size=size.tiny)
