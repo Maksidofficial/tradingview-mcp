@@ -3,12 +3,17 @@ name: scalp-bot
 description: Run the Liquidity Pool Scalp Bot — detect BSL/SSL sweep setups on futures, execute entries in replay mode or set live alerts. Use when the user wants to scalp futures using a liquidity-to-liquidity methodology on a 15-30 minute hold window.
 ---
 
-# Liquidity Pool Scalp Bot
+# Liquidity Pool Scalp Bot (v2)
 
-You are executing a liquidity-to-liquidity scalp strategy on futures. The edge is:
-**sweep a liquidity pool → displacement → enter at FVG/OB → target the next pool**.
+You are executing a liquidity-to-liquidity scalp strategy on futures. The edge is a
+three-stage sequence, tracked by the strategy's internal state machine:
 
-Hold window: 3-6 bars on the 5m chart (15-30 minutes).
+1. **SWEPT** — price wicks through a liquidity pool (swing high/low or PDH/PDL) and closes back inside
+2. **ARMED** — a displacement candle breaks minor market structure, creating an FVG/OB entry zone
+3. **ENTRY** — price retraces into the zone and all filters align (VWAP, HTF trend, volume, RSI, session, R:R ≥ 2)
+
+Hold window: 3-6 bars on the 5m chart (15-30 minutes). Stop moves to breakeven at +1R.
+Daily governor: max 3 trades, hard stop after 2 losses.
 
 ---
 
@@ -46,14 +51,17 @@ Switch to 15m temporarily:
 Read the dashboard:
 1. `data_get_pine_tables` with `study_filter: "Liquidity Scalp"` — get all table cells
 
-Look for in the dashboard output:
-- **SIGNAL** cell: `LONG ▲`, `SHORT ▼`, `WATCH ▲/▼`, or `NONE`
-- **CONFLUENCE**: score out of 5 (need ≥ 5 for a full entry, ≥ 3 for a watch)
-- **BSL / SSL**: nearest pool levels
-- **VWAP**: direction bias
+Key dashboard rows:
+- **LONG SETUP / SHORT SETUP**: `—` (idle), `SWEPT` (pool taken, awaiting displacement), `ARMED` (zone active, awaiting retrace)
+- **BSL / SSL / PDH / PDL**: liquidity pool levels
+- **VWAP** and **HTF TREND**: both must agree with trade direction
 - **SESSION**: must be `ACTIVE ✓`
+- **TRADES TODAY**: shows count vs limit and losses — if at limit, no more trades
 
-If SIGNAL shows `NONE` or CONFLUENCE < 3 — no trade. Advance bars and recheck.
+Interpretation:
+- Setup shows `SWEPT` → watch closely, a displacement candle arms the setup
+- Setup shows `ARMED` → an entry zone box is on the chart; entry fires when price retraces into it
+- Entry triangle + label appear when the trade actually fires
 
 Read exact entry levels:
 2. `data_get_pine_labels` with `study_filter: "Liquidity Scalp"` — get entry label with E/SL/TP values
@@ -141,14 +149,16 @@ To monitor continuously:
 
 | Rule | Guideline |
 |------|-----------|
-| Minimum confluence | 5/5 for entry, 3/5 for "watch" |
+| Entry sequence | SWEPT → ARMED → retrace into zone (never enter on the sweep bar itself) |
+| Direction filters | Price on the right side of VWAP **and** HTF 15m EMA trend must agree |
 | Session filter | London (02:00-11:00 UTC) or NY (08:30-16:00 ET) only |
 | Max hold | 6 bars (30 min on 5m) — close on time if not stopped/targeted |
 | Min R:R | 2:1 — the strategy only fires entries when this is met |
-| Stop placement | Beyond the swept liquidity level + 0.1% buffer |
-| Target | Nearest opposite liquidity pool |
-| Max daily trades | 3 — stop after 3 regardless of outcome |
-| After 2 losers | Stop for the session — do not revenge trade |
+| Stop placement | Beyond the sweep wick / zone bottom + 0.25 ATR buffer |
+| Breakeven | Stop auto-moves to entry once trade runs +1R |
+| Target | Nearest opposite liquidity pool (incl. PDH/PDL) |
+| Max daily trades | 3 — enforced by the strategy itself |
+| After 2 losers | Strategy hard-stops for the day — do not override |
 
 ---
 
