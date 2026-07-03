@@ -1,0 +1,496 @@
+//@version=5
+// v3 — BTC-tuned from a 30-day BTCUSDT-perp 5m backtest (see backtest/backtest_scalp.py).
+// Key findings baked into defaults:
+//   * Enter on the sweep-RECLAIM bar itself — every confirmation bar costs edge on a 30-min scalp
+//   * Wide stops (0.75 ATR beyond the wick) — tight wick-stops get chewed by 5m noise
+//   * Target must be REACHABLE: pool targets capped at 3.5 ATR
+//   * VWAP/HTF trend filters HURT sweep-reversal entries (they fire at lows/highs by design) — off by default
+//   * Costs dominate: use maker/limit orders; taker fees turn a breakeven edge deeply negative
+strategy("Liquidity Scalp Bot v3 [BTC]",
+     overlay           = true,
+     default_qty_type  = strategy.percent_of_equity,
+     default_qty_value = 2,
+     commission_type   = strategy.commission.percent,
+     commission_value  = 0.02,
+     slippage          = 1,
+     max_bars_back     = 500)
+
+// ═══════════════════════════════════════════════════════════
+//  INPUTS
+// ═══════════════════════════════════════════════════════════
+
+grp_mode  = "Entry Mode"
+mode      = input.string("Sweep Reclaim", "Entry Trigger", options=["Sweep Reclaim", "Retrace"],
+     group=grp_mode, tooltip="Sweep Reclaim: enter on the bar that wicks a pool and closes back inside (fast, backtested best). Retrace: wait for displacement + pullback into FVG/OB (conservative, more lag).")
+
+grp_liq   = "Liquidity Pools"
+liq_lb    = input.int(15,  "Pivot Lookback",        group=grp_liq, minval=5, maxval=50)
+max_pools = input.int(3,   "Max Levels to Track",   group=grp_liq, minval=1, maxval=5)
+use_pdhl  = input.bool(true, "Use PDH/PDL as Pools", group=grp_liq)
+use_round = input.bool(true, "Use Round Numbers as Pools", group=grp_liq)
+round_grd = input.float(500, "Round Number Grid ($)", group=grp_liq, minval=1,
+     tooltip="500 for BTC. Scale to instrument: ~50 for ETH, 0.5 for SOL, etc.")
+
+grp_seq   = "Setup Quality"
+min_pen   = input.float(0.15, "Min Sweep Penetration (ATR mult)", group=grp_seq, minval=0.0, step=0.05)
+reclaim_p = input.float(0.5,  "Min Reclaim Strength (close pos in bar range)", group=grp_seq, minval=0.0, maxval=1.0, step=0.05)
+disp_atr  = input.float(1.2,  "Displacement Body (ATR mult) [Retrace mode]", group=grp_seq, minval=0.5, step=0.1)
+ms_lb     = input.int(3,   "Minor Structure Lookback [Retrace mode]", group=grp_seq, minval=2, maxval=10)
+sweep_win = input.int(5,   "Sweep → Displacement Window [Retrace mode]", group=grp_seq, minval=1, maxval=10)
+retr_win  = input.int(5,   "Displacement → Entry Window [Retrace mode]", group=grp_seq, minval=1, maxval=10)
+
+grp_flt   = "Filters (backtest: trend filters hurt reversion entries — leave off)"
+vol_mult  = input.float(1.0, "Volume Mult on Signal Bar (>avg)", group=grp_flt, minval=0.5, step=0.1)
+rsi_hi    = input.float(60,  "Block Longs if RSI Above",  group=grp_flt, minval=50, maxval=90)
+rsi_lo    = input.float(30,  "Block Shorts if RSI Below", group=grp_flt, minval=10, maxval=50)
+use_htf   = input.bool(false, "HTF Trend Filter (hurts reversion — tested)", group=grp_flt)
+htf_tf    = input.timeframe("15", "HTF Timeframe", group=grp_flt)
+htf_len   = input.int(50,    "HTF EMA Length",     group=grp_flt, minval=10, maxval=200)
+use_vwap  = input.bool(false, "VWAP Trend Filter (hurts reversion — tested)", group=grp_flt)
+
+grp_risk  = "Risk Management"
+rr_min    = input.float(1.0, "Min R:R Ratio",            group=grp_risk, minval=0.5, step=0.1)
+stop_buf  = input.float(0.75,"Stop Buffer (ATR mult beyond wick)", group=grp_risk, minval=0.0, step=0.05)
+max_tgt   = input.float(3.5, "Max Target Distance (ATR mult)",     group=grp_risk, minval=0.5, step=0.5,
+     tooltip="Pool targets further than this are capped — a 30-min scalp can't reach a pool 5 ATR away.")
+max_hold  = input.int(9,     "Max Bars to Hold",         group=grp_risk, minval=1, maxval=20,
+     tooltip="9 x 5m = 45 min tested slightly better than 6 bars. Set 6 for a strict 30-min window.")
+use_be    = input.bool(true, "Move Stop to Breakeven",   group=grp_risk)
+be_trig   = input.float(1.0, "Breakeven Trigger (R mult)", group=grp_risk, minval=0.5, step=0.25)
+max_daily = input.int(3,     "Max Trades per Day",       group=grp_risk, minval=1, maxval=10)
+max_loss  = input.int(2,     "Stop After N Losses/Day",  group=grp_risk, minval=1, maxval=5)
+
+grp_sess  = "Session Filter (crypto trades 24/7 — off by default)"
+use_kz    = input.bool(false, "Only Trade Killzones",  group=grp_sess)
+kz1       = input.session("0700-1000", "Killzone 1 (UTC)", group=grp_sess)
+kz2       = input.session("1300-1700", "Killzone 2 (UTC)", group=grp_sess)
+
+grp_vis   = "Display"
+show_lvls = input.bool(true, "Show Liquidity Levels", group=grp_vis)
+show_zone = input.bool(true, "Show Entry Zone Box [Retrace mode]", group=grp_vis)
+
+// ═══════════════════════════════════════════════════════════
+//  CORE SERIES
+// ═══════════════════════════════════════════════════════════
+
+atr_val  = ta.atr(14)
+avg_vol  = ta.sma(volume, 20)
+rsi_val  = ta.rsi(close, 14)
+vwap_val = ta.vwap(close)
+
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+
+htf_ema      = request.security(syminfo.tickerid, htf_tf, ta.ema(close, htf_len), lookahead=barmerge.lookahead_off)
+htf_ok_long  = not use_htf or close > htf_ema
+htf_ok_short = not use_htf or close < htf_ema
+vwap_ok_long  = not use_vwap or close > vwap_val
+vwap_ok_short = not use_vwap or close < vwap_val
+
+in_session = not use_kz
+     or (not na(time(timeframe.period, kz1, "UTC")))
+     or (not na(time(timeframe.period, kz2, "UTC")))
+
+rng       = high - low
+close_pos = rng > 0 ? (close - low) / rng : 0.5
+
+// ═══════════════════════════════════════════════════════════
+//  LIQUIDITY POOLS  (pivots + PDH/PDL + round numbers)
+// ═══════════════════════════════════════════════════════════
+
+ph = ta.pivothigh(high, liq_lb, liq_lb)
+pl = ta.pivotlow(low,  liq_lb, liq_lb)
+
+var bsl_arr = array.new_float(0)
+var ssl_arr = array.new_float(0)
+
+if not na(ph)
+    array.unshift(bsl_arr, ph)
+    if array.size(bsl_arr) > max_pools
+        array.pop(bsl_arr)
+
+if not na(pl)
+    array.unshift(ssl_arr, pl)
+    if array.size(ssl_arr) > max_pools
+        array.pop(ssl_arr)
+
+bsl_near = array.size(bsl_arr) > 0 ? array.get(bsl_arr, 0) : na
+ssl_near = array.size(ssl_arr) > 0 ? array.get(ssl_arr, 0) : na
+
+round_up1 = math.ceil(close / round_grd) * round_grd
+round_up2 = round_up1 + round_grd
+round_dn1 = math.floor(close / round_grd) * round_grd
+round_dn2 = round_dn1 - round_grd
+
+// Minor swing points (retrace mode MSS)
+mph = ta.pivothigh(high, ms_lb, ms_lb)
+mpl = ta.pivotlow(low,  ms_lb, ms_lb)
+var float minor_high = na
+var float minor_low  = na
+if not na(mph)
+    minor_high := mph
+if not na(mpl)
+    minor_low := mpl
+
+// ═══════════════════════════════════════════════════════════
+//  SWEEP DETECTION  (all pool types, min penetration)
+// ═══════════════════════════════════════════════════════════
+
+f_sweep_below() =>
+    float lvl = na
+    if array.size(ssl_arr) > 0
+        for i = 0 to array.size(ssl_arr) - 1
+            l = array.get(ssl_arr, i)
+            if low < l and close > l and (l - low) >= atr_val * min_pen
+                lvl := l
+                break
+    if na(lvl) and use_pdhl and not na(pdl) and low < pdl and close > pdl and (pdl - low) >= atr_val * min_pen
+        lvl := pdl
+    if na(lvl) and use_round
+        for r = 0 to 1
+            rl = r == 0 ? round_dn1 : round_dn2
+            if low < rl and close > rl and (rl - low) >= atr_val * min_pen
+                lvl := rl
+                break
+    lvl
+
+f_sweep_above() =>
+    float lvl = na
+    if array.size(bsl_arr) > 0
+        for i = 0 to array.size(bsl_arr) - 1
+            l = array.get(bsl_arr, i)
+            if high > l and close < l and (high - l) >= atr_val * min_pen
+                lvl := l
+                break
+    if na(lvl) and use_pdhl and not na(pdh) and high > pdh and close < pdh and (high - pdh) >= atr_val * min_pen
+        lvl := pdh
+    if na(lvl) and use_round
+        for r = 0 to 1
+            rl = r == 0 ? round_up1 : round_up2
+            if high > rl and close < rl and (high - rl) >= atr_val * min_pen
+                lvl := rl
+                break
+    lvl
+
+f_target_up() =>
+    float t = na
+    if array.size(bsl_arr) > 0
+        for i = 0 to array.size(bsl_arr) - 1
+            l = array.get(bsl_arr, i)
+            if l > close and (na(t) or l < t)
+                t := l
+    if use_pdhl and not na(pdh) and pdh > close and (na(t) or pdh < t)
+        t := pdh
+    if use_round and round_up1 > close and (na(t) or round_up1 < t)
+        t := round_up1
+    t
+
+f_target_down() =>
+    float t = na
+    if array.size(ssl_arr) > 0
+        for i = 0 to array.size(ssl_arr) - 1
+            l = array.get(ssl_arr, i)
+            if l < close and (na(t) or l > t)
+                t := l
+    if use_pdhl and not na(pdl) and pdl < close and (na(t) or pdl > t)
+        t := pdl
+    if use_round and round_dn1 < close and (na(t) or round_dn1 > t)
+        t := round_dn1
+    t
+
+sweep_low_lvl  = f_sweep_below()
+sweep_high_lvl = f_sweep_above()
+
+// ═══════════════════════════════════════════════════════════
+//  RETRACE-MODE STATE MACHINE  (kept for the conservative mode)
+// ═══════════════════════════════════════════════════════════
+
+bull_disp = close > open and (close - open) > atr_val * disp_atr
+bear_disp = close < open and (open - close) > atr_val * disp_atr
+
+var int   l_state = 0
+var int   l_bar   = 0
+var float l_sweep_low = na
+var float l_zone_top  = na
+var float l_zone_bot  = na
+var int   s_state = 0
+var int   s_bar   = 0
+var float s_sweep_high = na
+var float s_zone_top   = na
+var float s_zone_bot   = na
+
+if l_state == 1 and bar_index - l_bar > sweep_win
+    l_state := 0
+if l_state == 2 and bar_index - l_bar > retr_win
+    l_state := 0
+if s_state == 1 and bar_index - s_bar > sweep_win
+    s_state := 0
+if s_state == 2 and bar_index - s_bar > retr_win
+    s_state := 0
+
+if not na(sweep_low_lvl) and strategy.position_size == 0
+    l_state     := 1
+    l_bar       := bar_index
+    l_sweep_low := low
+    s_state     := 0
+
+if not na(sweep_high_lvl) and strategy.position_size == 0
+    s_state      := 1
+    s_bar        := bar_index
+    s_sweep_high := high
+    l_state      := 0
+
+if l_state == 1 and bull_disp and not na(minor_high) and close > minor_high
+    l_state    := 2
+    l_bar      := bar_index
+    l_zone_top := high[1]
+    l_zone_bot := low[1]
+
+if s_state == 1 and bear_disp and not na(minor_low) and close < minor_low
+    s_state    := 2
+    s_bar      := bar_index
+    s_zone_top := high[1]
+    s_zone_bot := low[1]
+
+if l_state == 2 and bar_index == l_bar + 1 and low > high[2]
+    l_zone_top := low
+    l_zone_bot := high[2]
+
+if s_state == 2 and bar_index == s_bar + 1 and high < low[2]
+    s_zone_top := low[2]
+    s_zone_bot := high
+
+// ═══════════════════════════════════════════════════════════
+//  DAILY GOVERNOR
+// ═══════════════════════════════════════════════════════════
+
+var int trades_today = 0
+var int losses_today = 0
+
+if ta.change(time("D")) != 0
+    trades_today := 0
+    losses_today := 0
+
+if strategy.closedtrades > strategy.closedtrades[1]
+    if strategy.closedtrades.profit(strategy.closedtrades - 1) < 0
+        losses_today += 1
+
+can_trade = trades_today < max_daily and losses_today < max_loss
+
+// ═══════════════════════════════════════════════════════════
+//  ENTRY TRIGGERS
+// ═══════════════════════════════════════════════════════════
+
+sweep_mode = mode == "Sweep Reclaim"
+
+long_trig = sweep_mode
+     ? (not na(sweep_low_lvl) and close_pos >= reclaim_p)
+     : (l_state == 2 and bar_index > l_bar and low <= l_zone_top and close >= l_zone_bot and close > open)
+
+short_trig = sweep_mode
+     ? (not na(sweep_high_lvl) and close_pos <= 1 - reclaim_p)
+     : (s_state == 2 and bar_index > s_bar and high >= s_zone_bot and close <= s_zone_top and close < open)
+
+// Stops beyond the sweep wick, wide ATR buffer (backtest: 0.75 ATR >> 0.25 ATR)
+long_stop_raw  = (sweep_mode ? low  : math.min(nz(l_sweep_low, low), nz(l_zone_bot, low)))  - atr_val * stop_buf
+short_stop_raw = (sweep_mode ? high : math.max(nz(s_sweep_high, high), nz(s_zone_top, high))) + atr_val * stop_buf
+
+// Targets: nearest opposing pool, capped at reachable distance
+long_tgt_pool  = f_target_up()
+short_tgt_pool = f_target_down()
+long_tgt_raw   = na(long_tgt_pool)  ? close + atr_val * max_tgt :
+     math.min(long_tgt_pool,  close + atr_val * max_tgt)
+short_tgt_raw  = na(short_tgt_pool) ? close - atr_val * max_tgt :
+     math.max(short_tgt_pool, close - atr_val * max_tgt)
+
+long_rr_ok  = close > long_stop_raw  and (long_tgt_raw  - close) / (close - long_stop_raw)  >= rr_min
+short_rr_ok = close < short_stop_raw and (close - short_tgt_raw) / (short_stop_raw - close) >= rr_min
+
+vol_ok = volume > avg_vol * vol_mult
+
+long_fire = long_trig
+     and vol_ok
+     and rsi_val < rsi_hi
+     and vwap_ok_long
+     and htf_ok_long
+     and in_session
+     and can_trade
+     and long_rr_ok
+     and strategy.position_size == 0
+
+short_fire = short_trig
+     and vol_ok
+     and rsi_val > rsi_lo
+     and vwap_ok_short
+     and htf_ok_short
+     and in_session
+     and can_trade
+     and short_rr_ok
+     and strategy.position_size == 0
+
+// ═══════════════════════════════════════════════════════════
+//  EXECUTION + TRADE MANAGEMENT
+// ═══════════════════════════════════════════════════════════
+
+var float saved_stop = na
+var float saved_tgt  = na
+var float trade_risk = na
+var int   bars_held  = 0
+
+if long_fire
+    strategy.entry("Long", strategy.long)
+    saved_stop   := long_stop_raw
+    saved_tgt    := long_tgt_raw
+    trade_risk   := close - long_stop_raw
+    trades_today += 1
+    l_state      := 0
+
+if short_fire
+    strategy.entry("Short", strategy.short)
+    saved_stop   := short_stop_raw
+    saved_tgt    := short_tgt_raw
+    trade_risk   := short_stop_raw - close
+    trades_today += 1
+    s_state      := 0
+
+if strategy.position_size != 0
+    bars_held += 1
+else
+    bars_held := 0
+
+if strategy.position_size > 0
+    if use_be and not na(trade_risk) and high >= strategy.position_avg_price + trade_risk * be_trig
+        saved_stop := math.max(saved_stop, strategy.position_avg_price)
+    strategy.exit("L_Exit", "Long", stop=saved_stop, limit=saved_tgt)
+
+if strategy.position_size < 0
+    if use_be and not na(trade_risk) and low <= strategy.position_avg_price - trade_risk * be_trig
+        saved_stop := math.min(saved_stop, strategy.position_avg_price)
+    strategy.exit("S_Exit", "Short", stop=saved_stop, limit=saved_tgt)
+
+if bars_held >= max_hold and strategy.position_size != 0
+    strategy.close_all("Time Exit")
+
+// ═══════════════════════════════════════════════════════════
+//  VISUALS
+// ═══════════════════════════════════════════════════════════
+
+plot(show_lvls and not na(bsl_near) ? bsl_near : na, "BSL",
+     color=color.new(color.blue, 20), style=plot.style_circles)
+plot(show_lvls and not na(ssl_near) ? ssl_near : na, "SSL",
+     color=color.new(color.red, 20),  style=plot.style_circles)
+plot(show_lvls and use_pdhl ? pdh : na, "PDH",
+     color=color.new(color.blue, 55), style=plot.style_linebr)
+plot(show_lvls and use_pdhl ? pdl : na, "PDL",
+     color=color.new(color.red, 55),  style=plot.style_linebr)
+plot(show_lvls and use_round ? round_up1 : na, "Round Above",
+     color=color.new(color.gray, 60), style=plot.style_circles)
+plot(show_lvls and use_round ? round_dn1 : na, "Round Below",
+     color=color.new(color.gray, 60), style=plot.style_circles)
+plot(vwap_val, "VWAP", color=color.new(color.orange, 0), linewidth=2)
+
+var box l_box = na
+var box s_box = na
+
+if show_zone and not sweep_mode and l_state == 2 and na(l_box)
+    l_box := box.new(bar_index, l_zone_top, bar_index + retr_win, l_zone_bot,
+         border_color=color.new(color.green, 40), bgcolor=color.new(color.green, 85))
+if (sweep_mode or l_state != 2) and not na(l_box)
+    box.delete(l_box)
+    l_box := na
+
+if show_zone and not sweep_mode and s_state == 2 and na(s_box)
+    s_box := box.new(bar_index, s_zone_top, bar_index + retr_win, s_zone_bot,
+         border_color=color.new(color.red, 40), bgcolor=color.new(color.red, 85))
+if (sweep_mode or s_state != 2) and not na(s_box)
+    box.delete(s_box)
+    s_box := na
+
+plotshape(not na(sweep_low_lvl),  "SSL Sweep", style=shape.xcross,
+     location=location.belowbar, color=color.new(color.green, 30), size=size.tiny)
+plotshape(not na(sweep_high_lvl), "BSL Sweep", style=shape.xcross,
+     location=location.abovebar, color=color.new(color.red, 30), size=size.tiny)
+plotshape(long_fire,  "Long Entry",  style=shape.triangleup,
+     location=location.belowbar, color=color.green, size=size.normal)
+plotshape(short_fire, "Short Entry", style=shape.triangledown,
+     location=location.abovebar, color=color.red, size=size.normal)
+
+if long_fire
+    label.new(bar_index, low - atr_val,
+         "LONG\nE: "  + str.tostring(close, "#.#") +
+         "\nSL: " + str.tostring(long_stop_raw, "#.#") +
+         "\nTP: " + str.tostring(long_tgt_raw, "#.#"),
+         style=label.style_label_up, color=color.new(color.green, 20),
+         textcolor=color.white, size=size.small)
+
+if short_fire
+    label.new(bar_index, high + atr_val,
+         "SHORT\nE: "  + str.tostring(close, "#.#") +
+         "\nSL: " + str.tostring(short_stop_raw, "#.#") +
+         "\nTP: " + str.tostring(short_tgt_raw, "#.#"),
+         style=label.style_label_down, color=color.new(color.red, 20),
+         textcolor=color.white, size=size.small)
+
+// ═══════════════════════════════════════════════════════════
+//  DASHBOARD
+// ═══════════════════════════════════════════════════════════
+
+var table dash = table.new(position.top_right, 2, 12,
+     bgcolor=color.new(color.black, 75),
+     border_color=color.new(color.gray, 60), border_width=1,
+     frame_color=color.new(color.gray, 40), frame_width=1)
+
+if barstate.islast
+    table.cell(dash, 0, 0, "SCALP BOT v3", bgcolor=color.new(color.navy, 20),
+         text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 0, str.tostring(close, "#.#"),
+         bgcolor=color.new(color.navy, 20), text_color=color.yellow, text_size=size.small)
+
+    table.cell(dash, 0, 1, "MODE", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 1, sweep_mode ? "SWEEP RECLAIM" : "RETRACE",
+         text_color=color.aqua, text_size=size.tiny)
+
+    table.cell(dash, 0, 2, "BSL", text_color=color.new(color.blue, 20), text_size=size.tiny)
+    table.cell(dash, 1, 2, not na(bsl_near) ? str.tostring(bsl_near, "#.#") : "—",
+         text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 0, 3, "SSL", text_color=color.new(color.red, 0), text_size=size.tiny)
+    table.cell(dash, 1, 3, not na(ssl_near) ? str.tostring(ssl_near, "#.#") : "—",
+         text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 0, 4, "PDH / PDL", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 4, str.tostring(pdh, "#.#") + " / " + str.tostring(pdl, "#.#"),
+         text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 0, 5, "ROUND", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 5, str.tostring(round_dn1, "#") + " / " + str.tostring(round_up1, "#"),
+         text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 6, "RSI", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 6, str.tostring(math.round(rsi_val, 1)),
+         text_color=rsi_val > rsi_hi ? color.red : rsi_val < rsi_lo ? color.green : color.white,
+         text_size=size.tiny)
+    table.cell(dash, 0, 7, "VOLUME", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 7, vol_ok ? "OK ✓" : "LOW ✗",
+         text_color=vol_ok ? color.green : color.gray, text_size=size.tiny)
+    table.cell(dash, 0, 8, "SESSION", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 8, in_session ? "ACTIVE ✓" : "CLOSED",
+         text_color=in_session ? color.green : color.gray, text_size=size.tiny)
+
+    sig_txt = long_fire ? "LONG ▲" : short_fire ? "SHORT ▼" :
+         not na(sweep_low_lvl) ? "SSL SWEPT" : not na(sweep_high_lvl) ? "BSL SWEPT" :
+         l_state == 2 ? "LONG ARMED" : s_state == 2 ? "SHORT ARMED" : "NONE"
+    sig_col = long_fire ? color.lime : short_fire ? color.red :
+         not na(sweep_low_lvl) or l_state == 2 ? color.new(color.green, 40) :
+         not na(sweep_high_lvl) or s_state == 2 ? color.new(color.red, 40) : color.gray
+    table.cell(dash, 0, 9, "SIGNAL", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 9, sig_txt, text_color=sig_col, text_size=size.small)
+
+    table.cell(dash, 0, 10, "TRADES TODAY", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 10, str.tostring(trades_today) + "/" + str.tostring(max_daily) +
+         "  (L:" + str.tostring(losses_today) + ")",
+         text_color=can_trade ? color.white : color.red, text_size=size.tiny)
+
+    pos_txt = strategy.position_size > 0 ? "LONG "  + str.tostring(bars_held) + "b" :
+              strategy.position_size < 0 ? "SHORT " + str.tostring(bars_held) + "b" : "FLAT"
+    pos_col = strategy.position_size > 0 ? color.lime :
+              strategy.position_size < 0 ? color.red : color.gray
+    table.cell(dash, 0, 11, "POSITION", text_color=color.silver, text_size=size.tiny)
+    table.cell(dash, 1, 11, pos_txt, text_color=pos_col, text_size=size.tiny)
