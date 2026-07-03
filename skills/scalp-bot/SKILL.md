@@ -3,17 +3,37 @@ name: scalp-bot
 description: Run the Liquidity Pool Scalp Bot — detect BSL/SSL sweep setups on futures, execute entries in replay mode or set live alerts. Use when the user wants to scalp futures using a liquidity-to-liquidity methodology on a 15-30 minute hold window.
 ---
 
-# Liquidity Pool Scalp Bot (v2)
+# Liquidity Pool Scalp Bot (v3, BTC-tuned)
 
-You are executing a liquidity-to-liquidity scalp strategy on futures. The edge is a
-three-stage sequence, tracked by the strategy's internal state machine:
+You are executing a liquidity-to-liquidity scalp strategy. Two entry modes:
 
-1. **SWEPT** — price wicks through a liquidity pool (swing high/low or PDH/PDL) and closes back inside
-2. **ARMED** — a displacement candle breaks minor market structure, creating an FVG/OB entry zone
-3. **ENTRY** — price retraces into the zone and all filters align (VWAP, HTF trend, volume, RSI, session, R:R ≥ 2)
+- **Sweep Reclaim (default, backtested best)** — enter on the bar that wicks through a
+  liquidity pool (swing high/low, PDH/PDL, or round number) and closes back inside with
+  strength. Fast: zero confirmation lag.
+- **Retrace (conservative)** — wait for displacement + structure shift, then enter on the
+  pullback into the FVG/OB zone. More confirmation, more lag.
 
-Hold window: 3-6 bars on the 5m chart (15-30 minutes). Stop moves to breakeven at +1R.
-Daily governor: max 3 trades, hard stop after 2 losses.
+Hold window: up to 9 bars on 5m (45 min; set Max Bars to 6 for a strict 30-min window).
+Stop: 0.75 ATR beyond the sweep wick. Target: nearest opposing pool, capped at 3.5 ATR.
+Breakeven at +1R. Daily governor: max 3 trades, hard stop after 2 losses.
+
+## ⚠️ Backtest Findings (read before trading live)
+
+Validated against 30 days of real BTCUSDT-perp 5m data (`backtest/backtest_scalp.py`):
+
+1. **The raw edge is thin — roughly breakeven before costs.** Best config reached
+   profit factor ~0.9-1.0 with maker fees. This is NOT a money printer; treat it as a
+   framework for discretionary confirmation, not blind automation.
+2. **Costs decide everything.** Taker fees (0.05%/side) cost ~0.4R per trade at scalp
+   stop distances. Use limit/maker orders or don't trade this at all.
+3. **Tight stops fail.** Wick + 0.25 ATR stops got chewed by 5m noise (win rate 23%).
+   Wick + 0.75 ATR lifted win rate to ~45%.
+4. **VWAP/HTF trend filters HURT this setup** (PF dropped to 0.2-0.4 when enabled).
+   A sweep-reversal long happens at the lows — requiring price above VWAP contradicts
+   the setup. They are off by default; the dashboard still shows them as context.
+5. **Targets must be reachable.** Pool targets further than ~3.5 ATR can't be hit
+   within a 30-45 min hold; the strategy caps them.
+6. To re-validate on fresh data: `python3 backtest/fetch_okx.py 30 5m && python3 backtest/backtest_scalp.py`
 
 ---
 
@@ -52,16 +72,17 @@ Read the dashboard:
 1. `data_get_pine_tables` with `study_filter: "Liquidity Scalp"` — get all table cells
 
 Key dashboard rows:
-- **LONG SETUP / SHORT SETUP**: `—` (idle), `SWEPT` (pool taken, awaiting displacement), `ARMED` (zone active, awaiting retrace)
-- **BSL / SSL / PDH / PDL**: liquidity pool levels
-- **VWAP** and **HTF TREND**: both must agree with trade direction
-- **SESSION**: must be `ACTIVE ✓`
-- **TRADES TODAY**: shows count vs limit and losses — if at limit, no more trades
+- **MODE**: `SWEEP RECLAIM` or `RETRACE`
+- **SIGNAL**: `NONE`, `SSL SWEPT` / `BSL SWEPT` (sweep on current bar), `LONG/SHORT ARMED`
+  (retrace mode zone active), or `LONG ▲` / `SHORT ▼` (entry firing now)
+- **BSL / SSL / PDH / PDL / ROUND**: all tracked liquidity pool levels
+- **RSI / VOLUME / SESSION**: filter status
+- **TRADES TODAY**: count vs limit and losses — if at limit, no more trades
 
 Interpretation:
-- Setup shows `SWEPT` → watch closely, a displacement candle arms the setup
-- Setup shows `ARMED` → an entry zone box is on the chart; entry fires when price retraces into it
-- Entry triangle + label appear when the trade actually fires
+- In Sweep Reclaim mode the sweep bar IS the entry bar — signals appear and fire on the same candle
+- In Retrace mode: `SWEPT` → displacement arms a zone box → entry fires on the pullback into it
+- Entry triangle + label with E/SL/TP appear when the trade fires
 
 Read exact entry levels:
 2. `data_get_pine_labels` with `study_filter: "Liquidity Scalp"` — get entry label with E/SL/TP values
@@ -149,14 +170,15 @@ To monitor continuously:
 
 | Rule | Guideline |
 |------|-----------|
-| Entry sequence | SWEPT → ARMED → retrace into zone (never enter on the sweep bar itself) |
-| Direction filters | Price on the right side of VWAP **and** HTF 15m EMA trend must agree |
-| Session filter | London (02:00-11:00 UTC) or NY (08:30-16:00 ET) only |
-| Max hold | 6 bars (30 min on 5m) — close on time if not stopped/targeted |
-| Min R:R | 2:1 — the strategy only fires entries when this is met |
-| Stop placement | Beyond the sweep wick / zone bottom + 0.25 ATR buffer |
+| Entry (default mode) | The sweep-reclaim bar itself — wick through pool, strong close back inside |
+| Reclaim strength | Close must be in the upper 50% of the bar range (lower 50% for shorts) |
+| Order type | **Maker/limit orders only** — taker fees erase the edge (backtested) |
+| Trend filters | OFF — VWAP/HTF gating hurts sweep reversals (backtested); use as context only |
+| Max hold | 9 bars (45 min on 5m); set 6 for a strict 30-min window |
+| Min R:R | 1:1 against the capped target (wide stops make 2:1 unreachable intraday) |
+| Stop placement | Beyond the sweep wick + 0.75 ATR buffer — tight stops get chewed |
 | Breakeven | Stop auto-moves to entry once trade runs +1R |
-| Target | Nearest opposite liquidity pool (incl. PDH/PDL) |
+| Target | Nearest opposite pool (swing/PDH/PDL/round number), capped at 3.5 ATR |
 | Max daily trades | 3 — enforced by the strategy itself |
 | After 2 losers | Strategy hard-stops for the day — do not override |
 
